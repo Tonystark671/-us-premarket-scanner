@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import math
 import os
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 import requests
@@ -13,38 +12,19 @@ from flask import Flask, jsonify, render_template, request
 app = Flask(__name__)
 
 TV_URL = "https://scanner.tradingview.com/america/scan"
-UA = {"User-Agent": "Mozilla/5.0 USMomentumScanner/1.0"}
+YF_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+UA = {"User-Agent": "Mozilla/5.0 Pulse15/1.0"}
 NY = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
 
-MIN_TOTAL_MOVE = 5.0
-MIN_TOTAL_VOLUME = 90_000
-MAX_ROWS = 40
-
-# TradingView scanner columns. The app calculates the latest candle move from open|15 -> close|15.
+MAX_CANDIDATES = 35
+MAX_ROWS = 35
+MIN_TOTAL_VOLUME = 10_000
 TV_COLUMNS = [
     "name", "description", "exchange", "close", "change", "volume",
-    "open|15", "close|15", "volume|15", "EMA20|15", "EMA50|15", "BB.upper|15",
     "premarket_change", "premarket_volume", "premarket_close",
     "postmarket_change", "postmarket_volume", "postmarket_close",
-    "relative_volume_10d_calc",
 ]
-
-
-
-def current_session(now: datetime | None = None) -> str:
-    now = (now or datetime.now(tz=NY)).astimezone(NY)
-    if now.weekday() >= 5:
-        return "CLOSED"
-    m = now.hour * 60 + now.minute
-    if m >= 20 * 60 or m < 4 * 60:
-        return "OVERNIGHT"
-    if m < 9 * 60 + 30:
-        return "PRE-MARKET"
-    if m < 16 * 60:
-        return "MARKET"
-    if m < 20 * 60:
-        return "AFTER-HOURS"
-    return "CLOSED"
 
 
 def fnum(x):
@@ -55,7 +35,25 @@ def fnum(x):
         return None
 
 
-def tv_scan(session="MARKET") -> list[dict]:
+def current_session(now=None):
+    now = (now or datetime.now(tz=NY)).astimezone(NY)
+    if now.weekday() >= 5:
+        return "CLOSED"
+    m = now.hour * 60 + now.minute
+    if 4 * 60 <= m < 9 * 60 + 30:
+        return "PRE-MARKET"
+    if 9 * 60 + 30 <= m < 16 * 60:
+        return "MARKET"
+    if 16 * 60 <= m < 20 * 60:
+        return "AFTER-HOURS"
+    return "OVERNIGHT"
+
+
+def tv_candidates(session):
+    sort_col = {
+        "PRE-MARKET": "premarket_change",
+        "AFTER-HOURS": "postmarket_change",
+    }.get(session, "change")
     payload = {
         "filter": [
             {"left": "type", "operation": "equal", "right": "stock"},
@@ -65,58 +63,20 @@ def tv_scan(session="MARKET") -> list[dict]:
         "markets": ["america"],
         "symbols": {"query": {"types": []}, "tickers": []},
         "columns": TV_COLUMNS,
-        "sort": {"sortBy": {"PRE-MARKET": "premarket_change", "AFTER-HOURS": "postmarket_change"}.get(session, "change|15"), "sortOrder": "desc"},
-        "range": [0, 250],
+        "sort": {"sortBy": sort_col, "sortOrder": "desc"},
+        "range": [0, 120],
     }
     r = requests.post(TV_URL, json=payload, headers=UA, timeout=12)
     r.raise_for_status()
-    raw = r.json().get("data", [])
-    rows = []
-    for item in raw:
-        values = item.get("d", [])
-        if len(values) != len(TV_COLUMNS):
-            continue
-        d = dict(zip(TV_COLUMNS, values))
-        rows.append(d)
-    return rows
-
-
-@lru_cache(maxsize=256)
-def _cached_news(ticker: str, bucket: int) -> str:
-    # Best-effort, no-key headline lookup. If unavailable, return blank as requested.
-    try:
-        url = "https://query1.finance.yahoo.com/v1/finance/search"
-        r = requests.get(url, params={"q": ticker, "quotesCount": 1, "newsCount": 3}, headers=UA, timeout=5)
-        r.raise_for_status()
-        news = r.json().get("news", [])
-        if not news:
-            return ""
-        title = str(news[0].get("title") or "").strip()
-        return title[:150]
-    except Exception:
-        return ""
-
-
-def news_for(ticker: str) -> str:
-    return _cached_news(ticker, int(time.time() // 300))
-
-
-def normalize(rows: list[dict], session: str) -> list[dict]:
     out = []
-    if session in ("OVERNIGHT", "CLOSED"):
-        return []
-    signal_time = None
-    for d in rows:
+    for item in r.json().get("data", []):
+        vals = item.get("d", [])
+        if len(vals) != len(TV_COLUMNS):
+            continue
+        d = dict(zip(TV_COLUMNS, vals))
         ticker = str(d.get("name") or "").strip()
         if not ticker:
             continue
-
-        o15, c15 = fnum(d.get("open|15")), fnum(d.get("close|15"))
-        move15 = ((c15 - o15) / o15 * 100) if o15 and c15 else None
-        base_price = fnum(d.get("close"))
-        regular_change = fnum(d.get("change"))
-        regular_vol = fnum(d.get("volume")) or 0
-
         if session == "PRE-MARKET":
             total_move = fnum(d.get("premarket_change"))
             total_vol = fnum(d.get("premarket_volume")) or 0
@@ -125,67 +85,104 @@ def normalize(rows: list[dict], session: str) -> list[dict]:
             total_move = fnum(d.get("postmarket_change"))
             total_vol = fnum(d.get("postmarket_volume")) or 0
             price = fnum(d.get("postmarket_close"))
-        elif session == "MARKET":
-            total_move = regular_change
-            total_vol = regular_vol
-            price = c15 or base_price
         else:
+            total_move = fnum(d.get("change"))
+            total_vol = fnum(d.get("volume")) or 0
+            price = fnum(d.get("close"))
+        if total_move is None or total_vol < MIN_TOTAL_VOLUME:
             continue
-
-        if price is None or total_move is None:
-            continue
-        if total_move < MIN_TOTAL_MOVE or total_vol < MIN_TOTAL_VOLUME:
-            continue
-
-        ema20 = fnum(d.get("EMA20|15"))
-        ema50 = fnum(d.get("EMA50|15"))
-        upper = fnum(d.get("BB.upper|15"))
-        vol15 = fnum(d.get("volume|15")) or 0
-        rel = fnum(d.get("relative_volume_10d_calc"))
-
-        # Intraday indicators from this endpoint are not verified for extended sessions.
-        if session != "MARKET":
-            move15 = ema20 = ema50 = upper = vol15 = rel = None
-
-        signals = []
-        if move15 is not None and move15 >= 5:
-            signals.append("NEW MOMENTUM")
-        elif move15 is not None and move15 >= 3:
-            signals.append("EARLY MOVE")
-        if price is not None and upper is not None and price > upper:
-            signals.append("ABOVE UPPER BB (developing)")
-        if ema20 is not None and ema50 is not None and ema20 > ema50:
-            signals.append("EMA20 > EMA50")
-        if rel is not None and rel >= 2:
-            signals.append("DAILY RVOL ≥ 2")
-        if move15 is not None and move15 < 3 and total_move >= 20:
-            signals.append("OLD MOVE")
-
         out.append({
             "ticker": ticker,
             "company": d.get("description") or "",
             "exchange": d.get("exchange") or "",
-            "session": session,
             "price": price,
-            "move15": move15,
             "total_move": total_move,
-            "vol15": vol15,
             "total_volume": total_vol,
-            "rel_vol": rel,
-            "ema20": ema20,
-            "ema50": ema50,
-            "upper_bb": upper,
-            "signal_time": signal_time,
-            "signals": signals,
-            "news": "",
         })
-
-    out.sort(key=lambda x: x["move15"] if x["move15"] is not None else x["total_move"], reverse=True)
-    out = out[:MAX_ROWS]
-
-    # News is deliberately fetched only for the visible leaders to avoid hammering a free endpoint.
-    # Headlines are requested separately to keep scan refreshes fast.
+        if len(out) >= MAX_CANDIDATES:
+            break
     return out
+
+
+def _bucket_15(ts):
+    dt = datetime.fromtimestamp(ts, tz=UTC).astimezone(NY)
+    minute = (dt.minute // 15) * 15
+    return dt.replace(minute=minute, second=0, microsecond=0)
+
+
+def yf_15m(ticker):
+    r = requests.get(
+        YF_URL.format(ticker=ticker),
+        params={"interval": "5m", "range": "1d", "includePrePost": "true", "events": "div,splits"},
+        headers=UA,
+        timeout=8,
+    )
+    r.raise_for_status()
+    result = (r.json().get("chart", {}).get("result") or [None])[0]
+    if not result:
+        return None
+    stamps = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    vols = quote.get("volume") or []
+
+    buckets = {}
+    for i, ts in enumerate(stamps):
+        if i >= len(opens):
+            break
+        o, h, l, c = map(fnum, (opens[i], highs[i], lows[i], closes[i]))
+        v = fnum(vols[i]) or 0
+        if None in (o, h, l, c):
+            continue
+        b = _bucket_15(ts)
+        rec = buckets.setdefault(b, {"open": o, "high": h, "low": l, "close": c, "volume": 0.0, "start": b})
+        rec["high"] = max(rec["high"], h)
+        rec["low"] = min(rec["low"], l)
+        rec["close"] = c
+        rec["volume"] += v
+
+    bars = [buckets[k] for k in sorted(buckets)]
+    if len(bars) < 2:
+        return None
+    cur, prev = bars[-1], bars[-2]
+    move15 = (cur["close"] / cur["open"] - 1) * 100 if cur["open"] else None
+    vol_change = (cur["volume"] / prev["volume"] - 1) * 100 if prev["volume"] else None
+    high_change = (cur["high"] / prev["high"] - 1) * 100 if prev["high"] else None
+    return {
+        "move15": move15,
+        "candle": "GREEN" if cur["close"] > cur["open"] else "RED" if cur["close"] < cur["open"] else "FLAT",
+        "vol15": cur["volume"],
+        "prev_vol15": prev["volume"],
+        "vol_change": vol_change,
+        "high_change": high_change,
+        "bar_start": cur["start"].strftime("%H:%M ET"),
+        "bar_end": (cur["start"].timestamp() + 900),
+        "last_price": cur["close"],
+    }
+
+
+def build_scan(session):
+    candidates = tv_candidates(session)
+    rows = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(yf_15m, c["ticker"]): c for c in candidates}
+        for fut in as_completed(futs):
+            base = futs[fut]
+            try:
+                m = fut.result()
+            except Exception:
+                m = None
+            if not m:
+                continue
+            row = {**base, **m}
+            if row.get("last_price") is not None:
+                row["price"] = row["last_price"]
+            rows.append(row)
+    rows.sort(key=lambda x: (x.get("move15") is not None, x.get("move15") or -999), reverse=True)
+    return rows[:MAX_ROWS]
 
 
 @app.get("/")
@@ -196,39 +193,31 @@ def index():
 @app.get("/api/scan")
 def api_scan():
     requested = (request.args.get("mode") or "AUTO").upper()
-    allowed = {"AUTO", "OVERNIGHT", "PRE-MARKET", "MARKET", "AFTER-HOURS"}
+    allowed = {"AUTO", "PRE-MARKET", "MARKET", "AFTER-HOURS"}
     if requested not in allowed:
         return jsonify({"error": "Invalid session"}), 400
     session = current_session() if requested == "AUTO" else requested
-    base = {"session": session, "rows": [], "source": "TradingView public screener", "demo": False,
-            "fetched_at": datetime.now(tz=ZoneInfo("UTC")).isoformat()}
+    base = {
+        "session": session,
+        "rows": [],
+        "source": "TradingView movers + Yahoo 5m bars aggregated to 15m",
+        "fetched_at": datetime.now(tz=UTC).isoformat(),
+    }
     if session in {"OVERNIGHT", "CLOSED"}:
-        base["note"] = ("Overnight prices are unavailable from this feed. No regular-session prices are substituted."
-                        if session == "OVERNIGHT" else "Outside weekday session schedule. Holiday coverage is not verified.")
+        base["note"] = "Scanner is designed for pre-market, regular market and after-hours."
         return jsonify(base)
     try:
-        base["rows"] = normalize(tv_scan(session), session)
-        base["note"] = "Best-effort feed; exchange delay and quote timestamps are unverified. 15m values are developing, not confirmed closed candles."
-        if session != "MARKET":
-            base["note"] += " Extended-session 15m indicators are unavailable; sorted by session change."
-        if requested != "AUTO":
-            base["note"] += " Manual session view may contain values from a previous session."
+        base["rows"] = build_scan(session)
+        base["note"] = "Latest 15m candle is a developing candle until its 15-minute window closes. Sorted by current 15m % gain, highest first."
         return jsonify(base)
-    except Exception:
-        base["note"] = "Market feed unavailable. No demo prices are shown. Try again later."
+    except Exception as e:
+        base["note"] = f"Scanner feed unavailable: {type(e).__name__}"
         return jsonify(base), 503
-
-
-@app.get("/api/news/<ticker>")
-def api_news(ticker):
-    if len(ticker) > 15 or not all(c.isalnum() or c in '.-' for c in ticker):
-        return jsonify({"error": "Invalid ticker"}), 400
-    return jsonify({"headline": news_for(ticker), "note": "Related headline, not a verified explanation for the price move."})
 
 
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True, "session": current_session()})
+    return jsonify({"ok": True, "session": current_session(), "time_ny": datetime.now(tz=NY).isoformat()})
 
 
 if __name__ == "__main__":
