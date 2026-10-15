@@ -3,37 +3,34 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Pulse15 | US Scanner</title>
+<title>Pulse15 | 15m Scanner</title>
 <link rel="stylesheet" href="/static/style.css"/>
 </head>
 <body>
 <div class="wrap">
   <div class="header-grid">
-    <section class="card"><div class="label">🇬🇧 London</div><div id="ukClock" class="clock">--:--:--</div><div id="ukDate" class="muted"></div></section>
-    <section class="card"><div class="label">🇺🇸 New York</div><div id="nyClock" class="clock">--:--:--</div><div id="nyDate" class="muted"></div></section>
-    <section class="card"><div class="label">Current Session</div><div id="session" class="session">--</div><div id="source" class="muted">Connecting…</div></section>
-    <section class="card"><div class="label">US Sessions — UK Time</div><div id="timeline" class="timeline"></div></section>
+    <section class="card"><div class="label">London</div><div id="ukClock" class="clock">--:--:--</div><div id="ukDate" class="muted"></div></section>
+    <section class="card"><div class="label">New York</div><div id="nyClock" class="clock">--:--:--</div><div id="nyDate" class="muted"></div></section>
+    <section class="card"><div class="label">Session</div><div id="session" class="session">--</div><div id="source" class="muted">Connecting…</div></section>
   </div>
 
   <div class="title-row">
-    <div><h1>Pulse15 · US Scanner</h1><div class="muted">Session movers with 15-minute indicators when available.</div></div>
-    <div id="refreshStatus" class="pill">Refresh: 30s</div>
+    <div><h1>Pulse15</h1><div class="muted">Latest 15-minute candle scanner. Biggest gainer first.</div></div>
+    <div id="refreshStatus" class="pill">Refresh: 20s</div>
   </div>
 
   <div class="session-tabs">
     <button class="tab active" data-mode="AUTO">AUTO</button>
-    <button class="tab" data-mode="OVERNIGHT">OVERNIGHT</button>
     <button class="tab" data-mode="PRE-MARKET">PRE-MARKET</button>
     <button class="tab" data-mode="MARKET">MARKET</button>
     <button class="tab" data-mode="AFTER-HOURS">AFTER-HOURS</button>
   </div>
 
   <div class="rules">
-    <div class="mini"><span>Min total move</span><b>+5%</b></div>
-    <div class="mini"><span>Min total volume</span><b>90,000</b></div>
-    <div class="mini"><span>Primary sort</span><b>15m / session % ↓</b></div>
-    <div class="mini"><span>Signal candle</span><b>Developing 15m</b></div>
-    <div class="mini"><span>News</span><b>Related headline on tap</b></div>
+    <div class="mini"><span>Primary sort</span><b>15m gain ↓</b></div>
+    <div class="mini"><span>Current volume</span><b>Latest 15m</b></div>
+    <div class="mini"><span>Volume compare</span><b>vs previous 15m</b></div>
+    <div class="mini"><span>High compare</span><b>vs previous 15m</b></div>
   </div>
 
   <div id="note" class="note hidden"></div>
@@ -42,14 +39,22 @@
   <table>
     <thead>
       <tr>
-        <th>#</th><th>Ticker</th><th>Company</th><th>Price</th><th>15m %*</th><th>Total %</th><th>15m Vol</th><th>Total Vol</th><th>Rel Vol</th>
-        <th>EMA20</th><th>EMA50</th><th>Upper BB</th><th>Signal</th><th>Bar time</th><th>Related news</th>
+        <th>#</th>
+        <th>Ticker</th>
+        <th>15m Candle</th>
+        <th>15m %</th>
+        <th>Current 15m Vol</th>
+        <th>Previous 15m Vol</th>
+        <th>Vol vs Prev</th>
+        <th>High vs Prev High</th>
+        <th>Bar</th>
+        <th>Live?</th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
   </div>
-  <div id="empty" class="empty hidden">No qualifying stocks for this session.</div>
+  <div id="empty" class="empty hidden">No current scanner rows.</div>
 </div>
 <script src="/static/app.js"></script>
 </body>
